@@ -16,6 +16,7 @@ A single `email_action` tool with a discriminated union of actions:
 | `contacts` | List the name→address contact map |
 | `add-contact` | Map a person's name to an email address |
 | `remove-contact` | Remove that mapping |
+| `folders` | List the mailboxes, with special-use flags and unread counts |
 | `list` | Fetch the newest messages (`limit`, default 20), or those `since` a date |
 | `read` | Fetch one message's body and its attachment metadata |
 | `delete` | Flag `\Deleted` and expunge — irreversible |
@@ -28,6 +29,17 @@ A single `email_action` tool with a discriminated union of actions:
 Every action that addresses a mailbox takes an optional `folder`, defaulting to `INBOX`. A
 message `id` is a UID, which is unique only *within* one folder — so the folder passed
 to `read`/`delete`/`attachment_*` must be the one the `list` came from.
+
+Folder names are not guessable: the same folder is `Sent`, `INBOX.Sent` or `[Gmail]/Sent Mail`
+depending on the server. `folders` returns each mailbox's `path` (the string to pass back)
+along with its `specialUse` flag — `\Sent`, `\Drafts`, `\Trash`, `\Junk`, `\Archive` — which is
+the portable way to ask for one, plus `unseen` so "any unread mail?" is a single call. It
+reports subscribed and unsubscribed mailboxes alike, with `subscribed` on each, since a
+folder the plugin hid would be one the model could not reach.
+
+`specialUseSource` says how the flag was determined: `extension` is the server's own
+SPECIAL-USE/XLIST answer, `name` is imapflow matching known localised folder names — a
+guess, and worth distrusting.
 
 `list` with `since` (an ISO date) runs a server-side IMAP `SINCE` search rather than
 filtering the newest few, which is the difference that matters after a quiet week. IMAP
@@ -137,8 +149,6 @@ src/mailparser.d.ts # local types for mailparser, which ships none
   HTML-to-text conversion, which does not cover every multipart shape.
 - Each of `read`, `list_attachments`, `attachment_show` and `attachment_url` fetches and
   parses the whole message, so viewing two attachments costs three full downloads.
-- Materialised attachment paths carry no UIDVALIDITY, so a mailbox that reissues its UIDs
-  can re-serve a stale file under a UID that now names a different message.
 - Per-principal gating (multi-user deployments) is not wired in — this is a
   single-user plugin. The destructive arms would need gating on `currentPrincipal()`
   before a multi-user rollout.

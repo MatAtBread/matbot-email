@@ -22,6 +22,7 @@ declare module '@matatbread/matbot-plugin-api' {
       | ToolContract<{ contacts: Contact[] }, { action: 'contacts' }>
       | ToolContract<{ added: Contact }, { action: 'add-contact'; name: string; address: string }>
       | ToolContract<{ removed: boolean }, { action: 'remove-contact'; name: string }>
+      | ToolContract<{ folders: FolderInfo[] }, { action: 'folders'; account?: string }>
       | ToolContract<{ messages: MessageSummary[] }, { action: 'list'; account?: string; folder?: string; since?: string; limit?: number }>
       | ToolContract<{ message: MessageDetail; attachments: AttachmentInfo[] }, { action: 'read'; account?: string; folder?: string; id: string; markSeen?: boolean }>
       | ToolContract<{ deleted: boolean }, { action: 'delete'; account?: string; folder?: string; id: string }>
@@ -63,6 +64,21 @@ interface MessageSummary { id: string; subject: string; from: string; date: stri
 // mailparser's text, which is HTML-to-text converted when the message carries no plain part.
 interface MessageDetail extends MessageSummary { to: string; text: string; replyTo?: string }
 
+// One mailbox as the server reports it. `path` is the string every other action takes as `folder`;
+// `specialUse` is why this action exists at all — a server names its Sent folder "Sent", "INBOX.Sent" or
+// "[Gmail]/Sent Mail" as it pleases, and the \\Sent flag is the only portable way to ask for it.
+// `specialUseSource` is reported because "extension" is the server's own word and "name" is imapflow
+// matching against known localised names, which is a guess worth being able to distrust.
+interface FolderInfo {
+  path: string;
+  name: string;
+  delimiter: string;
+  specialUse?: string;
+  specialUseSource?: string;
+  subscribed: boolean;
+  unseen?: number;
+}
+
 // Metadata about a MIME attachment. The model reasons over this; the bytes stay on the server until asked.
 interface AttachmentInfo {
   part: string;
@@ -83,6 +99,7 @@ type EmailAction =
   | { action: 'contacts' }
   | { action: 'add-contact'; name: string; address: string }
   | { action: 'remove-contact'; name: string }
+  | { action: 'folders'; account?: string }
   | { action: 'list'; account?: string; folder?: string; since?: string; limit?: number }
   | { action: 'read'; account?: string; folder?: string; id: string; markSeen?: boolean }
   | { action: 'delete'; account?: string; folder?: string; id: string }
@@ -129,13 +146,17 @@ function showArm(mimeType: string): 'image' | 'audio' | 'document' | null {
   return null;
 }
 
-// A MIME part is addressed as <account-id>/<folder>/<uid>/<part>/<filename>, so a given attachment is
-// stored once and re-served by name. The folder is part of the address because a UID is only unique
-// within one mailbox. The path carries no UIDVALIDITY: if the mailbox reissues its UIDs, a stale
-// materialised file can be re-served under a UID that now names a different message.
-function attachmentPath(acct: Account, folder: string, uid: number, part: string, filename: string): string {
+// A MIME part is addressed as <account-id>/<folder>/<uidvalidity>/<uid>/<part>/<filename>, so a given
+// attachment is stored once and re-served by name.
+//
+// All three of folder, UIDVALIDITY and UID are needed to name a message. A UID is unique only within one
+// mailbox, and only for as long as the mailbox keeps its UIDVALIDITY — which is precisely the value the
+// server bumps to say "forget every UID you hold, they mean something else now". Without it a rebuilt
+// mailbox re-serves a stale file under a UID that names a different message: a cache hit on the wrong
+// message, which is worse than a miss because nothing looks wrong.
+function attachmentPath(acct: Account, folder: string, uidValidity: bigint, uid: number, part: string, filename: string): string {
   const safe = (s: string, fallback: string) => (s || fallback).replace(/[^a-zA-Z0-9._-]/g, '_');
-  return `${acct.id}/${safe(folder, DEFAULT_FOLDER)}/${uid}/${part}/${safe(filename, 'attachment')}`;
+  return `${acct.id}/${safe(folder, DEFAULT_FOLDER)}/${uidValidity}/${uid}/${part}/${safe(filename, 'attachment')}`;
 }
 
 // Derive a servable /files/ URL for a stored handle, exactly as url_for_resource does — reproduced rather
@@ -274,10 +295,11 @@ async function contactAddress(ctx: ToolContext, name: string): Promise<string> {
 
 // Fetch + parse a message (BODY.PEEK, so no \Seen side effect unless markSeen), returning detail + attachments.
 async function fetchMessage(ctx: ToolContext, acct: Account, folder: string, id: string, markSeen: boolean):
-  Promise<{ detail: MessageDetail; attachments: AttachmentInfo[]; parsed: Awaited<ReturnType<typeof simpleParser>> } | null> {
+  Promise<{ detail: MessageDetail; attachments: AttachmentInfo[]; parsed: Awaited<ReturnType<typeof simpleParser>>;
+            uidValidity: bigint } | null> {
   const client = await connectImap(ctx, acct);
   try {
-    await client.mailboxOpen(folder);
+    const mailbox = await client.mailboxOpen(folder);
     const found = await client.fetchOne(String(id), { source: true, envelope: true, flags: true }, { uid: true });
     if (!found) return null;
     const parsed = await simpleParser(found.source as Buffer);
@@ -294,7 +316,7 @@ async function fetchMessage(ctx: ToolContext, acct: Account, folder: string, id:
       ...(parsed.replyTo?.value?.[0]?.address ? { replyTo: parsed.replyTo.value[0].address } : {}),
     };
     if (markSeen) await client.messageFlagsAdd(String(id), ['\\Seen'], { uid: true });
-    return { detail, attachments: collectAttachments(parsed), parsed };
+    return { detail, attachments: collectAttachments(parsed), parsed, uidValidity: mailbox.uidValidity };
   } finally {
     await client.logout();
   }
@@ -314,6 +336,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     | { action: 'contacts' }
     | { action: 'add-contact';          name: string; address: string }
     | { action: 'remove-contact';       name: string }
+    | { action: 'folders';          account?: string }
     | { action: 'list';             account?: string; folder?: string; since?: string; limit?: number }
     | { action: 'read';             account?: string; folder?: string; id: string; markSeen?: boolean }
     | { action: 'delete';           account?: string; folder?: string; id: string }
@@ -333,6 +356,10 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   'id' is a UID, which is unique only WITHIN one folder — so pass the same folder to read/delete/attachment_*
   that you passed to the 'list' the id came from.
 
+  Do not GUESS a folder name: call 'folders' and use a returned 'path'. Servers name the same folder "Sent",
+  "INBOX.Sent" or "[Gmail]/Sent Mail", so match on 'specialUse' (\\Sent, \\Drafts, \\Trash, \\Junk,
+  \\Archive) rather than on the name. 'unseen' is the unread count, so "any unread mail?" is one call.
+
   'list' with 'since' (an ISO date) searches the server for mail on or after that date rather than filtering
   the newest few, which is the difference that matters after a quiet week. IMAP compares dates only, so the
   time of day in a timestamp is ignored.
@@ -346,7 +373,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     type: 'object',
     required: ['action'],
     properties: {
-      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'list', 'read', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'send', 'reply'] },
+      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'folders', 'list', 'read', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'send', 'reply'] },
       account:   { type: 'string' },
       address:   { type: 'string' },
       imapHost:  { type: 'string' },
@@ -438,6 +465,31 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
         case 'remove-contact': {
           const removed = await contactsStore!.delete(act.name);
           yield { type: 'result', value: { removed } };
+          return;
+        }
+
+        case 'folders': {
+          const acct = await resolveAccount(ctx, act.account);
+          const client = await connectImap(ctx, acct);
+          try {
+            // `unseen` only. The other STATUS items each cost a round trip per folder and answer nothing
+            // anyone asked; the unread count is what turns "is there anything new?" into one call.
+            const boxes = await client.list({ statusQuery: { unseen: true } });
+            // Everything, subscribed or not, with `subscribed` reported: a caller that wants to filter can,
+            // and a folder hidden by the plugin is one the model cannot reach at all.
+            const folders: FolderInfo[] = boxes.map(b => ({
+              path: b.path,
+              name: b.name,
+              delimiter: b.delimiter,
+              ...(b.specialUse !== undefined ? { specialUse: b.specialUse } : {}),
+              ...(b.specialUseSource !== undefined ? { specialUseSource: b.specialUseSource } : {}),
+              subscribed: b.subscribed,
+              ...(b.status?.unseen !== undefined ? { unseen: b.status.unseen } : {}),
+            }));
+            yield { type: 'result', value: { folders } };
+          } finally {
+            await client.logout();
+          }
           return;
         }
 
@@ -542,7 +594,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
           const bytes = attachmentContent(res.parsed, act.part);
           if (!bytes) { yield { type: 'error', message: `Could not fetch attachment part "${act.part}".` }; return; }
           const mime = (info.contentType as MimeType) || 'application/octet-stream';
-          const name = attachmentPath(acct, folderOf(act), Number(act.id), act.part, info.filename ?? 'attachment');
+          const name = attachmentPath(acct, folderOf(act), res.uidValidity, Number(act.id), act.part, info.filename ?? 'attachment');
           const handle = await ctx.files.put(name, mime, toIterable(bytes), { namespace: ATTACH_NS, allowed: true });
           const url = fileUrl(handle);
           if (url === undefined) {
