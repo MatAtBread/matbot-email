@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local env files — never commit
+.env
+.env.*
+!.env.example
+.data*
+
+# macOS
+.DS_Store

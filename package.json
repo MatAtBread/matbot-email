@@ -1,0 +1,54 @@
+{
+  "name": "@matatbread/matbot-email",
+  "matbotRuntime": [
+    "node"
+  ],
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "src"
+  ],
+  "description": "IMAP/SMTP email tools: list, read, delete, send and reply to mail on a generic mail server, with a name\u2192address contact map and attachment handling (metadata, show-to-model, servable URL).",
+  "keywords": [
+    "matbot",
+    "matbot-plugin",
+    "llm",
+    "ai",
+    "agent",
+    "email",
+    "imap",
+    "smtp",
+    "mail",
+    "attachments"
+  ],
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatAtBread/matbot-email.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@matatbread/matbot-plugin-api": "^0.4.0"
+  },
+  "dependencies": {
+    "imapflow": "^1.0.0",
+    "mailparser": "^3.7.0",
+    "nodemailer": "^10.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.0",
+    "@types/node": "^22.0.0",
+    "@matatbread/matbot-plugin-api": "^0.4.0"
+  }
+}
