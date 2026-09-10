@@ -8,6 +8,9 @@ import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { createHash } from 'node:crypto';
 import { collectStructure, type AttachmentInfo } from './structure.js';
+import {
+  ATTACH_NS, safeSegment, attachmentPath, parseAttachmentPath, storedAttachments, sweepMessageAttachments,
+} from './attachments.js';
 
 // ── Tool contracts ─────────────────────────────────────────────────────────────
 // The result + params pairing for each arm. `configure` and `set-password` are the only actions that
@@ -26,10 +29,11 @@ declare module '@matatbread/matbot-plugin-api' {
       | ToolContract<{ folders: FolderInfo[] }, { action: 'folders'; account?: string }>
       | ToolContract<{ messages: MessageSummary[] }, { action: 'list'; account?: string; folder?: string; since?: string; limit?: number }>
       | ToolContract<{ message: MessageDetail; attachments: AttachmentInfo[] }, { action: 'read'; account?: string; folder?: string; id: string; markSeen?: boolean }>
-      | ToolContract<{ deleted: boolean }, { action: 'delete'; account?: string; folder?: string; id: string }>
+      | ToolContract<{ deleted: boolean; attachmentsRemoved: number }, { action: 'delete'; account?: string; folder?: string; id: string }>
       | ToolContract<{ attachments: AttachmentInfo[] }, { action: 'list_attachments'; account?: string; folder?: string; id: string }>
       | ToolContract<{ url: string; name: string; bytes: number }, { action: 'attachment_url'; account?: string; folder?: string; id: string; part: string }>
       | ToolContract<{ name: string; mimeType: string; bytes: number }, { action: 'attachment_show'; account?: string; folder?: string; id: string; part: string }>
+      | ToolContract<PurgeReport, { action: 'purge_attachments'; account?: string }>
       | ToolContract<{ ok: true; messageId?: string }, { action: 'send'; account?: string; to: string | string[]; subject: string; body: string; replyTo?: string; attach?: string[] }>
       | ToolContract<{ ok: true }, { action: 'reply'; account?: string; folder?: string; id: string; body: string; attach?: string[] }>;
   }
@@ -97,13 +101,13 @@ type EmailAction =
   | { action: 'list_attachments'; account?: string; folder?: string; id: string }
   | { action: 'attachment_url'; account?: string; folder?: string; id: string; part: string }
   | { action: 'attachment_show'; account?: string; folder?: string; id: string; part: string }
+  | { action: 'purge_attachments'; account?: string }
   | { action: 'send'; account?: string; to: string | string[]; subject: string; body: string; replyTo?: string; attach?: string[] }
   | { action: 'reply'; account?: string; folder?: string; id: string; body: string; attach?: string[] };
 
 const ACCOUNTS_NS  = 'email_accounts';
 const CONTACTS_NS  = 'email_contacts';
 const WORKSPACE_NS = 'workspace';
-const ATTACH_NS    = 'email_attachments'; // attachments materialised here, never into the user's workspace
 
 const DEFAULT_FOLDER = 'INBOX';
 
@@ -145,9 +149,66 @@ function showArm(mimeType: string): 'image' | 'audio' | 'document' | null {
 // server bumps to say "forget every UID you hold, they mean something else now". Without it a rebuilt
 // mailbox re-serves a stale file under a UID that names a different message: a cache hit on the wrong
 // message, which is worse than a miss because nothing looks wrong.
-function attachmentPath(acct: Account, folder: string, uidValidity: bigint, uid: number, part: string, filename: string): string {
-  const safe = (s: string, fallback: string) => (s || fallback).replace(/[^a-zA-Z0-9._-]/g, '_');
-  return `${acct.id}/${safe(folder, DEFAULT_FOLDER)}/${uidValidity}/${uid}/${part}/${safe(filename, 'attachment')}`;
+interface PurgeReport { removed: number; bytes: number; kept: number; unchecked: number }
+
+// Reconcile everything stored for one account against the server. This is the mechanism that matters:
+// sweeping our own `delete` only reclaims what matbot itself destroyed, and the ordinary case is a
+// message deleted from webmail or a phone, which this plugin never hears about.
+//
+// A stale UIDVALIDITY generation is an orphan with no round trip at all — the server bumping it is a
+// statement that every UID under the old value now means something else — so the cheap half of the
+// answer costs nothing.
+//
+// Conservative on every uncertainty: a folder that will not open is REPORTED, never emptied. Failing to
+// check is not evidence of absence, and the wrong answer here deletes a file that is still reachable.
+async function purgeAccountAttachments(ctx: ToolContext, acct: Account, files: NonNullable<ToolContext['files']>): Promise<PurgeReport> {
+  // Grouped by the MANGLED folder segment, which is all the stored name carries.
+  const byFolder = new Map<string, { handle: FileHandle; addr: string }[]>();
+  for await (const handle of storedAttachments(files)) {
+    const parsed = parseAttachmentPath(handle.name);
+    if (!parsed || parsed.acctId !== acct.id) continue;
+    const group = byFolder.get(parsed.folder) ?? [];
+    group.push({ handle, addr: `${parsed.uidValidity}/${parsed.uid}` });
+    byFolder.set(parsed.folder, group);
+  }
+  const report: PurgeReport = { removed: 0, bytes: 0, kept: 0, unchecked: 0 };
+  if (byFolder.size === 0) return report;
+
+  const doomed: FileHandle[] = [];
+  const client = await connectImap(ctx, acct);
+  try {
+    const boxes = await client.list();
+    for (const [segment, group] of byFolder) {
+      // safeSegment is not invertible, so the real mailbox is recovered by mangling the server's own
+      // folder list and matching. More than one match is possible in principle; a UID live in ANY of
+      // them keeps the file, because the alternative deletes something still addressable.
+      const candidates = boxes.filter(b => safeSegment(b.path, DEFAULT_FOLDER) === segment);
+      if (candidates.length === 0) { doomed.push(...group.map(g => g.handle)); continue; }
+      const live = new Set<string>();
+      let checked = false;
+      for (const box of candidates) {
+        try {
+          const mailbox = await client.mailboxOpen(box.path, { readOnly: true });
+          const uids = await client.search({ all: true }, { uid: true });
+          for (const uid of uids || []) live.add(`${mailbox.uidValidity}/${uid}`);
+          checked = true;
+        } catch { /* \Noselect, gone, or refused — leave `checked` false for this candidate */ }
+      }
+      if (!checked) { report.unchecked += group.length; continue; }
+      for (const { handle, addr } of group) {
+        if (live.has(addr)) report.kept++; else doomed.push(handle);
+      }
+    }
+  } finally {
+    await client.logout();
+  }
+
+  for (const handle of doomed) {
+    await files.delete(handle.id);
+    report.removed++;
+    report.bytes += handle.size;
+  }
+  return report;
 }
 
 // Derive a servable /files/ URL for a stored handle, exactly as url_for_resource does — reproduced rather
@@ -349,6 +410,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     | { action: 'list_attachments'; account?: string; folder?: string; id: string }
     | { action: 'attachment_url';   account?: string; folder?: string; id: string; part: string }
     | { action: 'attachment_show';  account?: string; folder?: string; id: string; part: string }
+    | { action: 'purge_attachments'; account?: string }
     | { action: 'send';             account?: string; to: string | string[]; subject: string; body: string; replyTo?: string; attach?: string[] }
     | { action: 'reply';            account?: string; folder?: string; id: string; body: string; attach?: string[] };
 
@@ -380,12 +442,18 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   IMAP part number ("2", "1.2"). Nothing here marks the message read.
 
   Only the part you ask for is fetched, so showing one attachment does not download the others. A part too
-  large to put in context is refused with its size — use attachment_url for that one.`,
+  large to put in context is refused with its size — use attachment_url for that one.
+
+  attachment_url is the only action that keeps anything. 'delete' cleans up after itself, but a message
+  deleted elsewhere — webmail, a phone — leaves its saved attachments behind, because nothing tells this
+  plugin it went. purge_attachments reconciles the saved files against the server and deletes the
+  orphans; it never touches a file whose message is still there. Run it when asked to tidy up, or if the
+  user asks what the saved attachments are costing — not routinely, and not after a delete.`,
   inputSchema: {
     type: 'object',
     required: ['action'],
     properties: {
-      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'folders', 'list', 'read', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'send', 'reply'] },
+      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'folders', 'list', 'read', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'purge_attachments', 'send', 'reply'] },
       account:   { type: 'string' },
       address:   { type: 'string' },
       imapHost:  { type: 'string' },
@@ -596,13 +664,23 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
         case 'delete': {
           const acct = await resolveAccount(ctx, act.account);
           const client = await connectImap(ctx, acct);
+          let deleted = false;
+          let uidValidity: bigint | undefined;
           try {
-            await client.mailboxOpen(folderOf(act));
-            const deleted = await client.messageDelete(String(act.id), { uid: true });
-            yield { type: 'result', value: { deleted } };
+            const mailbox = await client.mailboxOpen(folderOf(act));
+            uidValidity = mailbox.uidValidity;
+            deleted = await client.messageDelete(String(act.id), { uid: true });
           } finally {
             await client.logout();
           }
+          // The message is gone; any part of it materialised under email_attachments is now unreachable
+          // through the tool that made it and would sit in the file store forever. Swept AFTER the
+          // logout, and best-effort: the destructive half has already happened, so a failure here is not
+          // a failure of the action, and reporting one would say the message survived.
+          const attachmentsRemoved = deleted && uidValidity !== undefined
+            ? await sweepMessageAttachments(ctx.files, acct.id, folderOf(act), uidValidity, Number(act.id))
+            : 0;
+          yield { type: 'result', value: { deleted, attachmentsRemoved } };
           return;
         }
 
@@ -633,7 +711,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
             // header on the bytes actually being sent.
             const mime = ((meta.contentType || info.contentType) ?? 'application/octet-stream') as MimeType;
             const filename = meta.filename ?? info.filename ?? 'attachment';
-            const name = attachmentPath(acct, folderOf(act), open.uidValidity, Number(act.id), act.part, filename);
+            const name = attachmentPath(acct.id, folderOf(act), open.uidValidity, Number(act.id), act.part, filename);
             const handle = await ctx.files.put(name, mime, content, { namespace: ATTACH_NS, allowed: true });
             const url = fileUrl(handle);
             if (url === undefined) {
@@ -646,6 +724,16 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
           } finally {
             await open.client.logout();
           }
+          return;
+        }
+
+        // Reclaim the file store: drop every materialised attachment whose message no longer exists.
+        // Explicit, never automatic — a reconcile costs a connection and a UID search per folder held, and
+        // hanging that off an ordinary read would charge every call for a housekeeping job nobody asked for.
+        case 'purge_attachments': {
+          const acct = await resolveAccount(ctx, act.account);
+          if (!ctx.files) { yield { type: 'error', message: 'No file store available, so no attachments have been materialised.' }; return; }
+          yield { type: 'result', value: await purgeAccountAttachments(ctx, acct, ctx.files) };
           return;
         }
 

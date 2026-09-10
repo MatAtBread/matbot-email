@@ -23,6 +23,7 @@ A single `email_action` tool with a discriminated union of actions:
 | `list_attachments` | Attachment metadata only: part, filename, type, size, disposition, cid |
 | `attachment_show` | Put one attachment in front of the **model's** eyes; bytes are never persisted |
 | `attachment_url` | Materialise one attachment into the file store and return a servable `/files/` URL for the **user** |
+| `purge_attachments` | Reconcile materialised attachments against the server and delete the orphans |
 | `send` | Send a message (confirm with the user first) |
 | `reply` | Reply to an existing message (confirm with the user first) |
 
@@ -55,6 +56,36 @@ are not interchangeable: `show` yields `model-content` (image / audio / PDF), wh
 the model can see and which dies with the turn; `url` writes the bytes into the
 `email_attachments` namespace with `allowed: true` and hands back a link. Neither
 marks the message read — both fetch via `BODY.PEEK`.
+
+## Attachment lifetime
+
+`attachment_url` is the only action that keeps anything. A materialised part is stored under
+`<account-id>/<folder>/<uidvalidity>/<uid>/<part>/<filename>`, so one attachment is stored once
+and re-served by name — and the address is reversible, which is what makes cleaning up a prefix
+match rather than a second index to keep in step.
+
+All three of folder, UIDVALIDITY and UID are needed to name a message. A UID is unique only
+within one mailbox, and only for as long as that mailbox keeps its UIDVALIDITY — which is
+precisely the value a server bumps to say *"forget every UID you hold, they mean something else
+now"*. Without it, a rebuilt mailbox re-serves a stale file under a UID naming a different
+message: a cache hit on the wrong message, which is worse than a miss because nothing looks wrong.
+
+Two mechanisms reclaim the space, because there are two ways a message goes:
+
+- **`delete` sweeps after itself.** Every part of the message it just expunged is dropped from the
+  file store. Best-effort by contract, and reported as `attachmentsRemoved`: the destructive half
+  has already happened, so a failure to tidy up is not a failure of the action — reporting one
+  would say the message survived.
+- **`purge_attachments` reconciles.** This is the mechanism that matters, because the ordinary case
+  is a message deleted from webmail or a phone, which this plugin never hears about. It opens each
+  folder it holds files for, asks for the live UIDs once, and deletes what no longer exists. A stale
+  UIDVALIDITY generation is an orphan with no round trip at all. It reports `removed`, `bytes`,
+  `kept` and `unchecked`.
+
+It is **explicit, never automatic**: a reconcile costs a connection and a UID search per folder
+held, and hanging that off an ordinary read would charge every call for housekeeping nobody asked
+for. It is also conservative on every uncertainty — a folder that will not open is counted in
+`unchecked` and never emptied, since failing to check is not evidence of absence.
 
 `read` returns the body once, as `text` — mailparser's plain text, HTML-to-text converted
 when the message carries no plain part. A tool result is persisted in the transcript and
@@ -134,6 +165,8 @@ a second copy). The package ships TypeScript source (`exports` points at
 package.json        # peer: plugin-api; deps: imapflow/nodemailer/mailparser
 tsconfig.json       # types: ["node"]
 src/index.ts        # the email_action tool + plugin spec
+src/structure.ts    # BODYSTRUCTURE walk: which MIME leaves are attachments
+src/attachments.ts  # attachment addressing + file-store cleanup (no plugin-api values, so testable)
 src/mailparser.d.ts # local types for mailparser, which ships none
 ```
 
@@ -148,6 +181,9 @@ src/mailparser.d.ts # local types for mailparser, which ships none
   it does not copy the original's other recipients.
 - `read` returns plain text; a message with no text part relies on mailparser's
   HTML-to-text conversion, which does not cover every multipart shape.
+- `purge_attachments` is per **account**, and reconciles only folders it currently holds files
+  for. An attachment saved from a folder that has since been renamed is indistinguishable from one
+  whose folder was deleted, so it is treated as an orphan and reclaimed.
 - Per-principal gating (multi-user deployments) is not wired in — this is a
   single-user plugin. The destructive arms would need gating on `currentPrincipal()`
   before a multi-user rollout.
