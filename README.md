@@ -85,16 +85,21 @@ by STARTTLS and needs `smtpTLS: false`. `smtpTLS` defaults from `smtpPort` (true
 false otherwise), so you rarely pass it. When it is false the transport sets `requireTLS`,
 making the upgrade mandatory — "not implicit TLS" never degrades to sending in the clear.
 
-## Install
+## Install from matbot CLI or web UI
 
-```bash
-plugin add @matatbread/matbot-email
+...over http
+```
+Add the plugin at https://raw.githubusercontent.com/MatAtBread/matbot-email/main/
+```
+
+...or from npm
+```
+Add the plugin at @matatbread/matbot-email
 ```
 
 or, against a checkout:
-
-```bash
-plugin add /path/to/matbot-email
+```
+Add the plugin at /path/to/matbot-email
 ```
 
 Provisioning installs `imapflow`, `nodemailer` and `mailparser` into the plugin's
@@ -104,15 +109,11 @@ a second copy). The package ships TypeScript source (`exports` points at
 
 ## First use
 
-1. `email_action { action: "configure", account: "me", address: "me@example.com", imapHost: "imap.example.com", imapPort: 993, smtpHost: "smtp.example.com", smtpPort: 465, useTLS: true, password: "…" }`
+1. Say to matbot: `Configure the email plugin`.
 
-   (If you'd rather not pass the password this way, `configure` without it and use
-   `set-password` later.)
+2. Optionally build the contacts map: `I want to add some email contact names` or `Add Fred as an email contact. His address is fred@example.net`
 
-2. Optionally build the contacts map:
-   `email_action { action: "add-contact", name: "Fred", address: "fred@example.com" }`
-
-3. Then you can say, in plain language:
+3. Then you can say:
    - *"check the emails from Fred and tell me if anything needs answering urgently"* → the model calls `list`, then `read`s the relevant ones.
    - *"email Fred that the invoice is settled"* → the model calls `send` (after confirming with you).
    - *"what's on the invoice he attached?"* → `list_attachments`, then `attachment_show`.
@@ -147,8 +148,6 @@ src/mailparser.d.ts # local types for mailparser, which ships none
   it does not copy the original's other recipients.
 - `read` returns plain text; a message with no text part relies on mailparser's
   HTML-to-text conversion, which does not cover every multipart shape.
-- Each of `read`, `list_attachments`, `attachment_show` and `attachment_url` fetches and
-  parses the whole message, so viewing two attachments costs three full downloads.
 - Per-principal gating (multi-user deployments) is not wired in — this is a
   single-user plugin. The destructive arms would need gating on `currentPrincipal()`
   before a multi-user rollout.
