@@ -178,17 +178,25 @@ function fileUrl(handle: FileHandle): string | undefined {
   return `/files/${prefix}${path}`;
 }
 
+// How an attachment is addressed. mailparser leaves `partId` null for an attachment with no parent
+// boundary (a single-part message whose body IS the attachment), and two of those both addressed as ''
+// — so `find` returned the first for either, silently showing the wrong file. A positional id stands in,
+// prefixed so it can never collide with a real partId, which is only digits and dots.
+function partIdOf(att: { partId: string | null }, index: number): string {
+  return att.partId ?? `#${index}`;
+}
+
 // Collect metadata for every attachment part in a parsed message. Bytes come from simpleParser's
 // decoded attachment buffers when actually shown, but are NOT pulled here — list_attachments is metadata only.
 function collectAttachments(parsed: Awaited<ReturnType<typeof simpleParser>>): AttachmentInfo[] {
   const out: AttachmentInfo[] = [];
   if (!parsed.attachments) return out;
-  for (const att of parsed.attachments) {
+  for (const [index, att] of parsed.attachments.entries()) {
     const cid = att.contentId ? att.contentId.replace(/^<|>$/g, '') : null;
     const disposition = att.contentDisposition ?? '';
     const inline = att.related === true || disposition.toLowerCase().includes('inline');
     out.push({
-      part: String(att.partId ?? ''),
+      part: partIdOf(att, index),
       filename: att.filename ?? null,
       contentType: att.contentType ?? null,
       size: att.size ?? null,
@@ -700,7 +708,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
 
 // Extract a single attachment part's decoded bytes from an already-parsed message.
 function attachmentContent(parsed: Awaited<ReturnType<typeof simpleParser>>, part: string): Buffer | null {
-  const att = parsed.attachments?.find(a => String(a.partId ?? '') === part);
+  const att = parsed.attachments?.find((a, i) => partIdOf(a, i) === part);
   return att ? (att.content as Buffer | undefined ?? null) : null;
 }
 

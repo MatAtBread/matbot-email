@@ -6,7 +6,9 @@
 declare module 'mailparser' {
   export interface MailAttachment {
     type: 'attachment';
-    partId: string;
+    /** null for an attachment with no parent boundary — a single-part message whose body IS the
+     *  attachment. mail-parser.js initialises it to null and only fills it in from a boundary. */
+    partId: string | null;
     content: Buffer;
     contentType?: string;
     filename?: string;
