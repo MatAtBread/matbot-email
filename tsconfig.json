@@ -12,7 +12,10 @@
     "erasableSyntaxOnly": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": false,
-    "noEmit": true
+    "noEmit": true,
+    // The test imports the source by its real extension; node strips types from .ts, not from a .js
+    // name that does not exist on disk.
+    "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*", "test/**/*"]
 }

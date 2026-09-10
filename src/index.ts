@@ -7,6 +7,7 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { createHash } from 'node:crypto';
+import { collectStructure, type AttachmentInfo } from './structure.js';
 
 // ── Tool contracts ─────────────────────────────────────────────────────────────
 // The result + params pairing for each arm. `configure` and `set-password` are the only actions that
@@ -77,16 +78,6 @@ interface FolderInfo {
   specialUseSource?: string;
   subscribed: boolean;
   unseen?: number;
-}
-
-// Metadata about a MIME attachment. The model reasons over this; the bytes stay on the server until asked.
-interface AttachmentInfo {
-  part: string;
-  filename: string | null;
-  contentType: string | null;
-  size: number | null;
-  inline: boolean;
-  cid: string | null;       // Content-ID, for inline/referenced images
 }
 
 // ── The discriminated union the executor switches on ──────────────────────────
@@ -176,35 +167,6 @@ function fileUrl(handle: FileHandle): string | undefined {
   const prefix = partition ? `~${encodeURIComponent(partition)}/` : '';
   const path = `${encodeURIComponent(handle.namespace)}/${handle.name.split('/').map(encodeURIComponent).join('/')}`;
   return `/files/${prefix}${path}`;
-}
-
-// How an attachment is addressed. mailparser leaves `partId` null for an attachment with no parent
-// boundary (a single-part message whose body IS the attachment), and two of those both addressed as ''
-// — so `find` returned the first for either, silently showing the wrong file. A positional id stands in,
-// prefixed so it can never collide with a real partId, which is only digits and dots.
-function partIdOf(att: { partId: string | null }, index: number): string {
-  return att.partId ?? `#${index}`;
-}
-
-// Collect metadata for every attachment part in a parsed message. Bytes come from simpleParser's
-// decoded attachment buffers when actually shown, but are NOT pulled here — list_attachments is metadata only.
-function collectAttachments(parsed: Awaited<ReturnType<typeof simpleParser>>): AttachmentInfo[] {
-  const out: AttachmentInfo[] = [];
-  if (!parsed.attachments) return out;
-  for (const [index, att] of parsed.attachments.entries()) {
-    const cid = att.contentId ? att.contentId.replace(/^<|>$/g, '') : null;
-    const disposition = att.contentDisposition ?? '';
-    const inline = att.related === true || disposition.toLowerCase().includes('inline');
-    out.push({
-      part: partIdOf(att, index),
-      filename: att.filename ?? null,
-      contentType: att.contentType ?? null,
-      size: att.size ?? null,
-      inline,
-      cid,
-    });
-  }
-  return out;
 }
 
 // Read workspace files (via ctx.files) into nodemailer attachment objects.
@@ -303,12 +265,11 @@ async function contactAddress(ctx: ToolContext, name: string): Promise<string> {
 
 // Fetch + parse a message (BODY.PEEK, so no \Seen side effect unless markSeen), returning detail + attachments.
 async function fetchMessage(ctx: ToolContext, acct: Account, folder: string, id: string, markSeen: boolean):
-  Promise<{ detail: MessageDetail; attachments: AttachmentInfo[]; parsed: Awaited<ReturnType<typeof simpleParser>>;
-            uidValidity: bigint } | null> {
+  Promise<{ detail: MessageDetail; attachments: AttachmentInfo[]; uidValidity: bigint } | null> {
   const client = await connectImap(ctx, acct);
   try {
     const mailbox = await client.mailboxOpen(folder);
-    const found = await client.fetchOne(String(id), { source: true, envelope: true, flags: true }, { uid: true });
+    const found = await client.fetchOne(String(id), { source: true, envelope: true, flags: true, bodyStructure: true }, { uid: true });
     if (!found) return null;
     const parsed = await simpleParser(found.source as Buffer);
     const from = found.envelope?.from?.[0];
@@ -324,10 +285,47 @@ async function fetchMessage(ctx: ToolContext, acct: Account, folder: string, id:
       ...(parsed.replyTo?.value?.[0]?.address ? { replyTo: parsed.replyTo.value[0].address } : {}),
     };
     if (markSeen) await client.messageFlagsAdd(String(id), ['\\Seen'], { uid: true });
-    return { detail, attachments: collectAttachments(parsed), parsed, uidValidity: mailbox.uidValidity };
+    return { detail, attachments: collectStructure(found.bodyStructure), uidValidity: mailbox.uidValidity };
   } finally {
     await client.logout();
   }
+}
+
+// Attachment metadata with NO body: one BODYSTRUCTURE fetch, and the connection closed again. This is
+// what `list_attachments` costs now — the whole message used to come down the wire for it.
+async function fetchStructure(ctx: ToolContext, acct: Account, folder: string, id: string):
+  Promise<{ attachments: AttachmentInfo[]; uidValidity: bigint } | null> {
+  const client = await connectImap(ctx, acct);
+  try {
+    const mailbox = await client.mailboxOpen(folder);
+    const found = await client.fetchOne(String(id), { bodyStructure: true }, { uid: true });
+    if (!found) return null;
+    return { attachments: collectStructure(found.bodyStructure), uidValidity: mailbox.uidValidity };
+  } finally {
+    await client.logout();
+  }
+}
+
+// Anything larger is not shown. `attachment_show` inlines the bytes into the turn as base64 — 4/3 of the
+// file — where they stay for the rest of it, so an unbounded one is a context blown on a single call.
+// Checked against BODYSTRUCTURE's declared size BEFORE downloading, rather than truncating mid-stream:
+// half a PDF is not a smaller answer, it is a corrupt one.
+const SHOW_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Open the message's structure and hand back the client with the mailbox still selected, so the caller
+ * can `download` a part on the same connection. The caller owns the logout — a stream is only readable
+ * while its connection lives, which is the whole reason this does not close it.
+ */
+async function openForPart(ctx: ToolContext, acct: Account, folder: string, id: string, part: string):
+  Promise<{ client: ImapFlow; info: AttachmentInfo; uidValidity: bigint } | { client: ImapFlow; error: string }> {
+  const client = await connectImap(ctx, acct);
+  const mailbox = await client.mailboxOpen(folder);
+  const found = await client.fetchOne(String(id), { bodyStructure: true }, { uid: true });
+  if (!found) return { client, error: `No message ${id} in ${folder}.` };
+  const info = collectStructure(found.bodyStructure).find(a => a.part === part);
+  if (!info) return { client, error: `No attachment part "${part}" on message ${id}.` };
+  return { client, info, uidValidity: mailbox.uidValidity };
 }
 
 // ── The executor ───────────────────────────────────────────────────────────────
@@ -372,11 +370,17 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   the newest few, which is the difference that matters after a quiet week. IMAP compares dates only, so the
   time of day in a timestamp is ignored.
 
-  Attachments: list_attachments returns metadata ONLY (part, filename, type, size, disposition, cid) with
-  NO bytes. To actually see one, use attachment_show — which puts the image/audio/document in front of
-  your eyes so you can reason about it, without persisting the bytes. To hand the USER something they can
-  open or view, use attachment_url — which materialises the bytes into a servable file and returns its
-  /files/ URL. Both fetch via BODY.PEEK so the message is not marked read.`,
+  Attachments: 'read' ALREADY returns the attachment list, so do not call list_attachments after a read —
+  it answers the same question. list_attachments is for when you have an id but have not read the message.
+  Both return metadata only (part, filename, type, size, disposition, cid) and NO bytes.
+
+  To see one yourself, use attachment_show — it puts the image/audio/document in front of your eyes so you
+  can reason about it, and the bytes are never persisted. To hand the USER something they can open, use
+  attachment_url — it saves the file and returns a link. Pass the 'part' exactly as reported; it is the
+  IMAP part number ("2", "1.2"). Nothing here marks the message read.
+
+  Only the part you ask for is fetched, so showing one attachment does not download the others. A part too
+  large to put in context is refused with its size — use attachment_url for that one.`,
   inputSchema: {
     type: 'object',
     required: ['action'],
@@ -604,7 +608,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
 
         case 'list_attachments': {
           const acct = await resolveAccount(ctx, act.account);
-          const res = await fetchMessage(ctx, acct, folderOf(act), act.id, false);
+          const res = await fetchStructure(ctx, acct, folderOf(act), act.id);
           if (res) {
             yield { type: 'result', value: { attachments: res.attachments } };
           } else {
@@ -614,51 +618,83 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
         }
 
         // Materialise one attachment into the FileStore (email_attachments namespace, allowed) and return
-        // its /files/ URL. The bytes are already decoded by simpleParser; we store them so the generic
-        // /files/ route and any frontend (web, telegram) can serve them without email-specific wiring.
+        // its /files/ URL, so the generic route and any frontend can serve it with no email-specific
+        // wiring. The part is STREAMED from the server into the store: `put` takes an AsyncIterable and a
+        // node Readable is one, so neither the message nor the attachment is ever held whole in memory.
         case 'attachment_url': {
           const acct = await resolveAccount(ctx, act.account);
-          const res = await fetchMessage(ctx, acct, folderOf(act), act.id, false);
-          if (!res) { yield { type: 'error', message: `No message ${act.id} in ${folderOf(act)}.` }; return; }
-          const info = res.attachments.find(a => a.part === act.part);
-          if (!info) { yield { type: 'error', message: `No attachment part "${act.part}" on message ${act.id}.` }; return; }
           if (!ctx.files) { yield { type: 'error', message: 'No file store available to materialise the attachment.' }; return; }
-          const bytes = attachmentContent(res.parsed, act.part);
-          if (!bytes) { yield { type: 'error', message: `Could not fetch attachment part "${act.part}".` }; return; }
-          const mime = (info.contentType as MimeType) || 'application/octet-stream';
-          const name = attachmentPath(acct, folderOf(act), res.uidValidity, Number(act.id), act.part, info.filename ?? 'attachment');
-          const handle = await ctx.files.put(name, mime, toIterable(bytes), { namespace: ATTACH_NS, allowed: true });
-          const url = fileUrl(handle);
-          if (url === undefined) {
-            yield { type: 'error', message:
-              `Stored the attachment, but this file store gives it no namespace, so it has no address under ` +
-              `/files/ and cannot be linked. It is saved as "${handle.name}".` };
-            return;
+          const open = await openForPart(ctx, acct, folderOf(act), act.id, act.part);
+          try {
+            if ('error' in open) { yield { type: 'error', message: open.error }; return; }
+            const { info } = open;
+            const { meta, content } = await open.client.download(String(act.id), act.part, { uid: true });
+            // The server's own answer for this part beats the structure's where they differ — it is the
+            // header on the bytes actually being sent.
+            const mime = ((meta.contentType || info.contentType) ?? 'application/octet-stream') as MimeType;
+            const filename = meta.filename ?? info.filename ?? 'attachment';
+            const name = attachmentPath(acct, folderOf(act), open.uidValidity, Number(act.id), act.part, filename);
+            const handle = await ctx.files.put(name, mime, content, { namespace: ATTACH_NS, allowed: true });
+            const url = fileUrl(handle);
+            if (url === undefined) {
+              yield { type: 'error', message:
+                `Stored the attachment, but this file store gives it no namespace, so it has no address under ` +
+                `/files/ and cannot be linked. It is saved as "${handle.name}".` };
+              return;
+            }
+            yield { type: 'result', value: { url, name: handle.name, bytes: handle.size } };
+          } finally {
+            await open.client.logout();
           }
-          yield { type: 'result', value: { url, name: handle.name, bytes: handle.size } };
           return;
         }
 
         // Put one attachment in front of the model's eyes (model-content), never persisting the bytes.
         case 'attachment_show': {
           const acct = await resolveAccount(ctx, act.account);
-          const res = await fetchMessage(ctx, acct, folderOf(act), act.id, false);
-          if (!res) { yield { type: 'error', message: `No message ${act.id} in ${folderOf(act)}.` }; return; }
-          const info = res.attachments.find(a => a.part === act.part);
-          if (!info) { yield { type: 'error', message: `No attachment part "${act.part}" on message ${act.id}.` }; return; }
-          const bytes = attachmentContent(res.parsed, act.part);
-          if (!bytes) { yield { type: 'error', message: `Could not fetch attachment part "${act.part}".` }; return; }
-          const mime = (info.contentType as MimeType) || 'application/octet-stream';
-          const arm = showArm(mime);
-          if (arm === null) {
-            yield { type: 'error', message: `Attachment part "${act.part}" is ${mime}, which is better read than shown.` };
-            return;
+          const open = await openForPart(ctx, acct, folderOf(act), act.id, act.part);
+          try {
+            if ('error' in open) { yield { type: 'error', message: open.error }; return; }
+            const { info } = open;
+            const mime = (info.contentType ?? 'application/octet-stream') as MimeType;
+            const arm = showArm(mime);
+            if (arm === null) {
+              yield { type: 'error', message: `Attachment part "${act.part}" is ${mime}, which is better read than shown.` };
+              return;
+            }
+            // Refused on the DECLARED size, before a byte is fetched. Truncating instead would hand the
+            // model half a PDF, which is not a smaller answer but a corrupt one.
+            if (info.size !== null && info.size > SHOW_MAX_BYTES) {
+              yield { type: 'error', message:
+                `Attachment part "${act.part}" is ${Math.round(info.size / 1024 / 1024)}MB, too large to put in ` +
+                `context. Use attachment_url to give the user a link to it instead.` };
+              return;
+            }
+            const { content } = await open.client.download(String(act.id), act.part, { uid: true });
+            const chunks: Buffer[] = [];
+            let total = 0;
+            for await (const chunk of content) {
+              total += (chunk as Buffer).length;
+              // A server may under-report, or report nothing at all: the declared size is a claim, and the
+              // stream is the fact. Stop rather than fill the context on the strength of a wrong number.
+              if (total > SHOW_MAX_BYTES) {
+                content.destroy();
+                yield { type: 'error', message:
+                  `Attachment part "${act.part}" is larger than its declared size and exceeds the show limit. ` +
+                  `Use attachment_url instead.` };
+                return;
+              }
+              chunks.push(chunk as Buffer);
+            }
+            const bytes = Buffer.concat(chunks);
+            const data = bytes.toString('base64');
+            yield { type: 'model-content', content: [arm === 'document'
+              ? { type: 'document', data, mimeType: mime, name: info.filename ?? 'attachment' }
+              : { type: arm, data, mimeType: mime }] };
+            yield { type: 'result', value: { name: info.filename ?? 'attachment', mimeType: mime, bytes: bytes.length } };
+          } finally {
+            await open.client.logout();
           }
-          const data = Buffer.from(bytes).toString('base64');
-          yield { type: 'model-content', content: [arm === 'document'
-            ? { type: 'document', data, mimeType: mime as MimeType, name: info.filename ?? 'attachment' }
-            : { type: arm, data, mimeType: mime as MimeType }] };
-          yield { type: 'result', value: { name: info.filename ?? 'attachment', mimeType: mime, bytes: Buffer.from(bytes).length } };
           return;
         }
 
@@ -727,18 +763,6 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     },
   },
 };
-
-// ── Helpers for the attachment arms ────────────────────────────────────────────
-
-// Extract a single attachment part's decoded bytes from an already-parsed message.
-function attachmentContent(parsed: Awaited<ReturnType<typeof simpleParser>>, part: string): Buffer | null {
-  const att = parsed.attachments?.find((a, i) => partIdOf(a, i) === part);
-  return att ? (att.content as Buffer | undefined ?? null) : null;
-}
-
-function toIterable(buf: Buffer): AsyncIterable<Uint8Array> {
-  return (async function* () { yield new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength); })();
-}
 
 // ── Plugin spec ────────────────────────────────────────────────────────────────
 
