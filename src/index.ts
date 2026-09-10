@@ -417,7 +417,9 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
           const id = accountId(act.address, act.imapHost, act.imapPort);
           const existing = await accountsStore.get(id);
           const acct: Account = {
-            id, version: existing?.version ?? crypto.randomUUID(),
+            // A NEW version every write. Reusing the one just read would leave the stored version
+            // constant, and a compare-and-swap against a value that never changes cannot detect anything.
+            id, version: crypto.randomUUID(),
             address: act.address, imapHost: act.imapHost, imapPort: act.imapPort,
             smtpHost: act.smtpHost, smtpPort: act.smtpPort, useTLS: act.useTLS ?? true,
             // Defaulted from the PORT, which is the thing that actually decides it: 465 is implicit TLS,
@@ -427,8 +429,27 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
             tag: act.account,
           };
           // The password's vault key is derived purely from the id — never stored, never looked up.
+          //
+          // Written BEFORE the account, and deliberately: the key comes from the id, which is a hash of
+          // the mailbox identity, so the secret is right for this mailbox whatever happens to the record.
+          // A secret stored for a write that then loses a CAS is inert; an account stored without its
+          // secret cannot authenticate.
           if (act.password) await ctx.vault.createSecret(`email_${id}_password`, act.password);
-          await accountsStore.set(acct.id, acct);
+
+          // `cas` requires a document to compare against — it reports ok:false for one that does not
+          // exist — so a create is a `set`, which has no earlier version to contradict, and only an
+          // update is a compare-and-swap.
+          if (existing === null) {
+            await accountsStore.set(acct.id, acct);
+          } else {
+            const res = await accountsStore.cas(acct.id, existing.version, acct);
+            if (!res.ok) {
+              yield { type: 'error', message:
+                `Account "${act.account}" was changed by something else while this was being written — ` +
+                `nothing was saved. Read it back with 'accounts' and configure again.` };
+              return;
+            }
+          }
           yield { type: 'result', value: { ok: true, account: acct.address } };
           return;
         }
@@ -437,7 +458,10 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
           if (!accountsStore) throw new Error('email accounts store is not ready');
           const acct = await resolveAccount(ctx, act.account);
           await ctx.vault.createSecret(`email_${acct.id}_password`, act.password);
-          yield { type: 'result', value: { ok: true, account: act.account } };
+          // The address, not the reference passed in: `account` is resolved from a tag, an id OR an
+          // address, so echoing the input would make one result field mean three different things, and
+          // `configure` already answers with the address.
+          yield { type: 'result', value: { ok: true, account: acct.address } };
           return;
         }
 
