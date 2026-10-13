@@ -6,6 +6,7 @@ import type {
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
+import MailComposer from 'nodemailer/lib/mail-composer';
 import { createHash } from 'node:crypto';
 import { collectStructure, type AttachmentInfo } from './structure.js';
 import {
@@ -19,7 +20,7 @@ import {
 declare module '@matatbread/matbot-plugin-api' {
   interface ToolContracts {
     email_action:
-      | ToolContract<{ ok: true; account: string }, { action: 'configure'; account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string }>
+      | ToolContract<{ ok: true; account: string }, { action: 'configure'; account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string; saveSent?: boolean; sentFolder?: string }>
       | ToolContract<{ ok: true; account: string }, { action: 'set-password'; account: string; password: string }>
       | ToolContract<{ removed: boolean }, { action: 'remove-account'; account: string }>
       | ToolContract<{ accounts: Account[] }, { action: 'accounts' }>
@@ -34,8 +35,8 @@ declare module '@matatbread/matbot-plugin-api' {
       | ToolContract<{ url: string; name: string; bytes: number }, { action: 'attachment_url'; account?: string; folder?: string; id: string; part: string }>
       | ToolContract<{ name: string; mimeType: string; bytes: number }, { action: 'attachment_show'; account?: string; folder?: string; id: string; part: string }>
       | ToolContract<PurgeReport, { action: 'purge_attachments'; account?: string }>
-      | ToolContract<{ ok: true; messageId?: string }, { action: 'send'; account?: string; to: string | string[]; subject: string; body: string; replyTo?: string; attach?: string[] }>
-      | ToolContract<{ ok: true }, { action: 'reply'; account?: string; folder?: string; id: string; body: string; attach?: string[] }>;
+      | ToolContract<SendReport, { action: 'send'; account?: string; to: string | string[]; subject: string; body: string; replyTo?: string; attach?: string[] }>
+      | ToolContract<SendReport, { action: 'reply'; account?: string; folder?: string; id: string; body: string; attach?: string[] }>;
   }
 }
 
@@ -56,6 +57,15 @@ interface Account {
   // Queryable via the store's filter grammar; distinct from `id`, which is a stable hash of the mailbox
   // identity so reconfiguring the same mailbox reuses the same id (and the same derived vault key).
   tag: string;
+  // SMTP delivers; it does not file a copy. Whether the SENDER's mailbox shows what it sent is a separate
+  // IMAP APPEND, which is why this is an account setting rather than something a send decides: on a
+  // generic server nothing files the copy and the default must be true, while a server that files it
+  // itself (Gmail does, for mail submitted over its own SMTP) would then show every sent message twice.
+  // Absent means true — accounts configured before this existed get the copy, which is the fix.
+  saveSent?: boolean;
+  // The mailbox to append to, for a server whose Sent folder carries no \\Sent flag. Absent means
+  // "ask the server", which is the portable answer and the one to prefer; a name is never guessed.
+  sentFolder?: string;
 }
 
 interface Contact {
@@ -87,7 +97,7 @@ interface FolderInfo {
 // ── The discriminated union the executor switches on ──────────────────────────
 
 type EmailAction =
-  | { action: 'configure'; account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string }
+  | { action: 'configure'; account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string; saveSent?: boolean; sentFolder?: string }
   | { action: 'set-password'; account: string; password: string }
   | { action: 'remove-account'; account: string }
   | { action: 'accounts' }
@@ -150,6 +160,13 @@ function showArm(mimeType: string): 'image' | 'audio' | 'document' | null {
 // mailbox re-serves a stale file under a UID that names a different message: a cache hit on the wrong
 // message, which is worse than a miss because nothing looks wrong.
 interface PurgeReport { removed: number; bytes: number; kept: number; unchecked: number }
+
+// What a send reports. `messageId` is the id of the bytes actually delivered, read off the composed
+// message rather than from the transport's reply, so it matches the copy filed in Sent. The copy is
+// reported as a FACT either way: `sentCopy` is the folder it landed in, and `sentCopyError` says why
+// there is none — the delivery itself already succeeded, so a filing failure must be visible without
+// reading as "the mail was not sent", which would invite a second send to the same recipient.
+interface SendReport { ok: true; messageId?: string; sentCopy?: string; sentCopyError?: string }
 
 // Reconcile everything stored for one account against the server. This is the mechanism that matters:
 // sweeping our own `delete` only reclaims what matbot itself destroyed, and the ordinary case is a
@@ -276,6 +293,55 @@ async function smtpTransport(ctx: ToolContext, acct: Account) {
   });
 }
 
+// Append the bytes that were just delivered to the account's Sent mailbox. Throws with a reason, which
+// the caller turns into `sentCopyError`: by the time this runs the message is gone, so nothing here may
+// present itself as a send failure.
+async function appendToSent(ctx: ToolContext, acct: Account, raw: Buffer): Promise<string> {
+  const client = await connectImap(ctx, acct);
+  try {
+    // \\Sent is the only portable way to ask. The NAME is the server's choice — "Sent", "INBOX.Sent",
+    // "[Gmail]/Sent Mail" — so a guessed one either files the copy where the server will never show it as
+    // sent, or has the server create a second folder beside the real one.
+    const path = acct.sentFolder ?? (await client.list()).find(b => b.specialUse === '\\Sent')?.path;
+    if (!path) {
+      throw new Error(
+        `This server reports no \\Sent mailbox, so there is nowhere portable to file the copy. `
+        + `Call 'folders' to see the paths it does have, then set it explicitly: `
+        + `configure with the same settings plus sentFolder.`);
+    }
+    // \Seen because the sender has, by definition, read what they sent — without it every sent message
+    // arrives as unread mail in the sender's own Sent folder and inflates the unseen count 'list' reports.
+    const res = await client.append(path, raw, ['\\Seen']);
+    if (res === false) throw new Error(`The server refused the APPEND to "${path}".`);
+    return path;
+  } finally {
+    await client.logout();
+  }
+}
+
+// Both send paths, in one place. The message is composed ONCE and the same bytes are handed to SMTP and
+// to IMAP, so the copy in Sent is byte-identical to what the recipient got, Message-ID and all — rather
+// than a second rendering of the same intent, which threads as a different message and reports a
+// different id than the one the recipient can be asked about.
+async function sendAndFile(ctx: ToolContext, acct: Account, mail: MailComposer.Options): Promise<SendReport> {
+  const composed = new MailComposer({ ...mail, from: acct.address }).compile();
+  const raw = await composed.build();
+  const transporter = await smtpTransport(ctx, acct);
+  // `raw` is used AS IS, so nodemailer parses no headers out of it and derives no envelope from them:
+  // without an explicit envelope it sends to nobody at all and reports success.
+  const envelope = composed.getEnvelope();
+  // `from` is declared `string | false` — false for a message carrying no From, which this one always
+  // has — and an SMTP envelope with no sender is rejected by the server, not by the compiler.
+  await transporter.sendMail({ raw, envelope: { ...envelope, from: envelope.from || acct.address } });
+  const messageId = composed.messageId();
+  if (acct.saveSent === false) return { ok: true, messageId };
+  try {
+    return { ok: true, messageId, sentCopy: await appendToSent(ctx, acct, raw) };
+  } catch (e) {
+    return { ok: true, messageId, sentCopyError: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 async function connectImap(ctx: ToolContext, acct: Account): Promise<ImapFlow> {
   const pass = await ctx.vault.resolve(accountVaultKey(acct));
   const client = new ImapFlow({
@@ -396,7 +462,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   description: `Manage email on a generic IMAP/SMTP server.
 
   type EmailAction =
-    | { action: 'configure';        account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string }
+    | { action: 'configure';        account: string; address: string; imapHost: string; imapPort: number; smtpHost: string; smtpPort: number; useTLS?: boolean; smtpTLS?: boolean; password?: string; saveSent?: boolean; sentFolder?: string }
     | { action: 'set-password';     account: string; password: string }
     | { action: 'remove-account';   account: string }
     | { action: 'accounts' }
@@ -431,6 +497,12 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   'list' with 'since' (an ISO date) searches the server for mail on or after that date rather than filtering
   the newest few, which is the difference that matters after a quiet week. IMAP compares dates only, so the
   time of day in a timestamp is ignored.
+
+  Sent copies: SMTP only delivers, so send/reply also APPEND the sent message to the account's \\Sent
+  folder over IMAP — the result says where in 'sentCopy'. A 'sentCopyError' means the message WAS sent and
+  only the filed copy failed: report it, never re-send. A server that files its own copies (Gmail, for mail
+  submitted to its SMTP) would otherwise show two, so configure that account with saveSent: false; a server
+  reporting no \\Sent folder needs an explicit sentFolder from 'folders'.
 
   Attachments: 'read' ALREADY returns the attachment list, so do not call list_attachments after a read —
   it answers the same question. list_attachments is for when you have an id but have not read the message.
@@ -475,6 +547,8 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
       attach:    { type: 'array', items: { type: 'string' }, description: 'Workspace file name(s) to attach.' },
       name:      { type: 'string' },
       markSeen:  { type: 'boolean' },
+      saveSent:  { type: 'boolean', description: 'File a copy of each sent message in the account\'s Sent folder over IMAP. Defaults to true; set false for a server that files its own (Gmail).' },
+      sentFolder:{ type: 'string', description: 'Mailbox path to file sent copies in. Defaults to the \\Sent folder the server reports; set this only when it reports none.' },
     },
   },
   executor: {
@@ -488,6 +562,8 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
           // reuses the same id — and the same derived vault key — regardless of its display tag.
           const id = accountId(act.address, act.imapHost, act.imapPort);
           const existing = await accountsStore.get(id);
+          const saveSent = act.saveSent ?? existing?.saveSent;
+          const sentFolder = act.sentFolder ?? existing?.sentFolder;
           const acct: Account = {
             // A NEW version every write. Reusing the one just read would leave the stored version
             // constant, and a compare-and-swap against a value that never changes cannot detect anything.
@@ -499,6 +575,11 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
             smtpTLS: act.smtpTLS ?? act.smtpPort === 465,
             createdAt: existing?.createdAt ?? now(),
             tag: act.account,
+            // Carried over when this configure does not mention them: reconfiguring a host or a port is
+            // not a statement about filing sent mail, and silently dropping the setting would start
+            // duplicating (or stop filing) copies for a reason nobody connected to the edit.
+            ...(saveSent !== undefined ? { saveSent } : {}),
+            ...(sentFolder !== undefined ? { sentFolder } : {}),
           };
           // The password's vault key is derived purely from the id — never stored, never looked up.
           //
@@ -789,14 +870,12 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
         case 'send': {
           const acct = await resolveAccount(ctx, act.account);
           const to = await Promise.all((Array.isArray(act.to) ? act.to : [act.to]).map(a => contactAddress(ctx, a)));
-          const transporter = await smtpTransport(ctx, acct);
           const attachments = await buildAttachments(ctx, act.attach);
-          const result = await transporter.sendMail({
-            from: acct.address, to, subject: act.subject, text: act.body,
+          yield { type: 'result', value: await sendAndFile(ctx, acct, {
+            to, subject: act.subject, text: act.body,
             ...(act.replyTo ? { replyTo: act.replyTo } : {}),
             ...(attachments.length ? { attachments } : {}),
-          });
-          yield { type: 'result', value: { ok: true, messageId: result.messageId } };
+          }) };
           return;
         }
 
@@ -818,7 +897,6 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
             if (!to) {
               yield { type: 'error', message: 'Could not determine the original sender to reply to.' };
             } else {
-              const transporter = await smtpTransport(ctx, acct);
               const attachments = await buildAttachments(ctx, act.attach);
               // What makes this a reply rather than a new message with a "Re:" subject. A client threads
               // on In-Reply-To/References, never on the subject line, so without these the reply opens a
@@ -831,15 +909,14 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
                     : Array.isArray(parsed.references) ? parsed.references : []),
                 ...(parentId !== undefined ? [parentId] : []),
               ].filter(Boolean);
-              await transporter.sendMail({
-                from: acct.address, to,
+              yield { type: 'result', value: await sendAndFile(ctx, acct, {
+                to,
                 subject: parsed.subject?.startsWith('Re: ') ? parsed.subject : `Re: ${parsed.subject ?? '(no subject)'}`,
                 text: act.body,
                 ...(parentId !== undefined ? { inReplyTo: parentId } : {}),
                 ...(chain.length ? { references: chain } : {}),
                 ...(attachments.length ? { attachments } : {}),
-              });
-              yield { type: 'result', value: { ok: true } };
+              }) };
             }
           }
           return;

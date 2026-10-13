@@ -24,8 +24,28 @@ A single `email_action` tool with a discriminated union of actions:
 | `attachment_show` | Put one attachment in front of the **model's** eyes; bytes are never persisted |
 | `attachment_url` | Materialise one attachment into the file store and return a servable `/files/` URL for the **user** |
 | `purge_attachments` | Reconcile materialised attachments against the server and delete the orphans |
-| `send` | Send a message (confirm with the user first) |
-| `reply` | Reply to an existing message (confirm with the user first) |
+| `send` | Send a message, filing a copy in `Sent` (confirm with the user first) |
+| `reply` | Reply to an existing message, filing a copy in `Sent` (confirm with the user first) |
+
+### Sent copies
+
+SMTP delivers; it does not file a copy — that is the client's job, which is why a message sent
+by a plugin that only talks to SMTP reaches its recipient and appears nowhere in the sender's
+own mailbox. So `send` and `reply` compose the message **once**, hand those bytes to SMTP and
+`APPEND` the same bytes to the account's `\Sent` folder over IMAP (flagged `\Seen`). The copy
+is therefore byte-identical to what was delivered, `Message-ID` included, rather than a second
+rendering that would thread as a different message; the result reports the folder in `sentCopy`.
+
+The delivery has already happened by then, so a filing failure is reported as `sentCopyError`
+beside `ok: true` and never as a send failure — the one thing that must not happen is a retry
+that mails the recipient twice. Two accounts need configuring:
+
+- a server that files its own copies (Gmail, for mail submitted to its own SMTP) would show
+  everything twice — `configure` it with `saveSent: false`;
+- a server reporting no `\Sent` mailbox has nowhere portable to file to, so pass an explicit
+  `sentFolder` path from `folders`. A name is never guessed.
+
+Both settings survive a later `configure` that does not mention them.
 
 Every action that addresses a mailbox takes an optional `folder`, defaulting to `INBOX`. A
 message `id` is a UID, which is unique only *within* one folder — so the folder passed
@@ -177,6 +197,9 @@ src/mailparser.d.ts # local types for mailparser, which ships none
   means nothing there. A tool cannot invoke another tool, and returning a bare file name
   would push resolution onto every frontend, so this is a stated coupling rather than a
   claim of neutrality.
+- A sent copy is filed from **this** machine, so a server-side rule that files or re-files sent
+  mail itself is not detected — `saveSent: false` is the switch, and there is no way to ask a
+  server whether it does.
 - `reply` threads correctly (`In-Reply-To`/`References`) but replies only to the sender —
   it does not copy the original's other recipients.
 - `read` returns plain text; a message with no text part relies on mailparser's
