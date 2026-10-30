@@ -18,7 +18,8 @@ A single `email_action` tool with a discriminated union of actions:
 | `remove-contact` | Remove that mapping |
 | `folders` | List the mailboxes, with special-use flags and unread counts |
 | `list` | Fetch the newest messages (`limit`, default 20), or those `since` a date |
-| `read` | Fetch one message's body and its attachment metadata |
+| `read` | Fetch one message's body and its attachment metadata (leaves it unread unless `markSeen: true`) |
+| `mark` | Mark one or more messages read (`seen: true`) or unread (`seen: false`); reports which ids were `notFound` in that folder |
 | `delete` | Flag `\Deleted` and expunge — irreversible |
 | `list_attachments` | Attachment metadata only: part, filename, type, size, disposition, cid |
 | `attachment_show` | Put one attachment in front of the **model's** eyes; bytes are never persisted |

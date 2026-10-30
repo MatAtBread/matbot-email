@@ -12,6 +12,7 @@ import { collectStructure, type AttachmentInfo } from './structure.js';
 import {
   ATTACH_NS, safeSegment, attachmentPath, parseAttachmentPath, storedAttachments, sweepMessageAttachments,
 } from './attachments.js';
+import { isSeen, parseUids } from './flags.js';
 
 // ── Tool contracts ─────────────────────────────────────────────────────────────
 // The result + params pairing for each arm. `configure` and `set-password` are the only actions that
@@ -30,6 +31,7 @@ declare module '@matatbread/matbot-plugin-api' {
       | ToolContract<{ folders: FolderInfo[] }, { action: 'folders'; account?: string }>
       | ToolContract<{ messages: MessageSummary[] }, { action: 'list'; account?: string; folder?: string; since?: string; limit?: number }>
       | ToolContract<{ message: MessageDetail; attachments: AttachmentInfo[] }, { action: 'read'; account?: string; folder?: string; id: string; markSeen?: boolean }>
+      | ToolContract<MarkReport, { action: 'mark'; account?: string; folder?: string; id: string | string[]; seen: boolean }>
       | ToolContract<{ deleted: boolean; attachmentsRemoved: number }, { action: 'delete'; account?: string; folder?: string; id: string }>
       | ToolContract<{ attachments: AttachmentInfo[] }, { action: 'list_attachments'; account?: string; folder?: string; id: string }>
       | ToolContract<{ url: string; name: string; bytes: number }, { action: 'attachment_url'; account?: string; folder?: string; id: string; part: string }>
@@ -79,6 +81,12 @@ interface MessageSummary { id: string; subject: string; from: string; date: stri
 // mailparser's text, which is HTML-to-text converted when the message carries no plain part.
 interface MessageDetail extends MessageSummary { to: string; text: string; replyTo?: string }
 
+// `marked` is read back from the server after the STORE, not echoed from the request: a UID is unique only
+// within its folder, so an id from another folder's 'list' names nothing here, and the server's OK for the
+// STORE does not say so. `notFound` is that case made visible rather than reported as success; `unchanged`
+// is a message that is there but kept its old state (a read-only folder, a server ignoring the STORE).
+interface MarkReport { seen: boolean; marked: string[]; notFound: string[]; unchanged?: string[] }
+
 // One mailbox as the server reports it. `path` is the string every other action takes as `folder`;
 // `specialUse` is why this action exists at all — a server names its Sent folder "Sent", "INBOX.Sent" or
 // "[Gmail]/Sent Mail" as it pleases, and the \\Sent flag is the only portable way to ask for it.
@@ -107,6 +115,7 @@ type EmailAction =
   | { action: 'folders'; account?: string }
   | { action: 'list'; account?: string; folder?: string; since?: string; limit?: number }
   | { action: 'read'; account?: string; folder?: string; id: string; markSeen?: boolean }
+  | { action: 'mark'; account?: string; folder?: string; id: string | string[]; seen: boolean }
   | { action: 'delete'; account?: string; folder?: string; id: string }
   | { action: 'list_attachments'; account?: string; folder?: string; id: string }
   | { action: 'attachment_url'; account?: string; folder?: string; id: string; part: string }
@@ -407,7 +416,7 @@ async function fetchMessage(ctx: ToolContext, acct: Account, folder: string, id:
       from: from ? `${from.name ? from.name + ' ' : ''}<${from.address}>` : '(unknown sender)',
       to: to ? (to.address ?? '') : '',
       date: found.envelope?.date ? new Date(found.envelope.date).toISOString() : null,
-      seen: Array.isArray(found.flags) && found.flags.includes('\\Seen'),
+      seen: isSeen(found.flags),
       text: parsed.text ?? '',
       ...(parsed.replyTo?.value?.[0]?.address ? { replyTo: parsed.replyTo.value[0].address } : {}),
     };
@@ -472,6 +481,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     | { action: 'folders';          account?: string }
     | { action: 'list';             account?: string; folder?: string; since?: string; limit?: number }
     | { action: 'read';             account?: string; folder?: string; id: string; markSeen?: boolean }
+    | { action: 'mark';             account?: string; folder?: string; id: string | string[]; seen: boolean }
     | { action: 'delete';           account?: string; folder?: string; id: string }
     | { action: 'list_attachments'; account?: string; folder?: string; id: string }
     | { action: 'attachment_url';   account?: string; folder?: string; id: string; part: string }
@@ -493,6 +503,10 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
   Do not GUESS a folder name: call 'folders' and use a returned 'path'. Servers name the same folder "Sent",
   "INBOX.Sent" or "[Gmail]/Sent Mail", so match on 'specialUse' (\\Sent, \\Drafts, \\Trash, \\Junk,
   \\Archive) rather than on the name. 'unseen' is the unread count, so "any unread mail?" is one call.
+
+  Read state: 'list' and 'read' report 'seen'. 'read' leaves a message unread unless markSeen: true; 'mark'
+  sets it explicitly — seen: true marks read, seen: false marks unread — for one id or an array of them,
+  without reading the message. Its result says which ids were marked and which were 'notFound' in that folder.
 
   'list' with 'since' (an ISO date) searches the server for mail on or after that date rather than filtering
   the newest few, which is the difference that matters after a quiet week. IMAP compares dates only, so the
@@ -525,7 +539,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
     type: 'object',
     required: ['action'],
     properties: {
-      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'folders', 'list', 'read', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'purge_attachments', 'send', 'reply'] },
+      action:    { type: 'string', enum: ['configure', 'set-password', 'remove-account', 'accounts', 'contacts', 'add-contact', 'remove-contact', 'folders', 'list', 'read', 'mark', 'delete', 'list_attachments', 'attachment_url', 'attachment_show', 'purge_attachments', 'send', 'reply'] },
       account:   { type: 'string' },
       address:   { type: 'string' },
       imapHost:  { type: 'string' },
@@ -536,7 +550,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
       smtpTLS:   { type: 'boolean', description: 'SMTP implicit TLS. Defaults from smtpPort: true for 465, false (STARTTLS) otherwise.' },
       password:  { type: 'string' },
       folder:    { type: 'string', description: 'Mailbox to act on. Defaults to INBOX.' },
-      id:        { type: 'string' },
+      id:        { type: ['string', 'array'], items: { type: 'string' }, description: 'A message id from list. Only mark takes an array.' },
       part:      { type: 'string' },
       since:     { type: 'string' },
       limit:     { type: 'number' },
@@ -547,6 +561,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
       attach:    { type: 'array', items: { type: 'string' }, description: 'Workspace file name(s) to attach.' },
       name:      { type: 'string' },
       markSeen:  { type: 'boolean' },
+      seen:      { type: 'boolean', description: 'mark: true marks read, false marks unread.' },
       saveSent:  { type: 'boolean', description: 'File a copy of each sent message in the account\'s Sent folder over IMAP. Defaults to true; set false for a server that files its own (Gmail).' },
       sentFolder:{ type: 'string', description: 'Mailbox path to file sent copies in. Defaults to the \\Sent folder the server reports; set this only when it reports none.' },
     },
@@ -718,7 +733,7 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
                 subject: msg.envelope?.subject ?? '(no subject)',
                 from: from ? `${from.name ? from.name + ' ' : ''}<${from.address}>` : '(unknown sender)',
                 date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : null,
-                seen: Array.isArray(msg.flags) && msg.flags.includes('\\Seen'),
+                seen: isSeen(msg.flags),
               });
             }
             out.reverse(); // newest first
@@ -736,6 +751,28 @@ const emailTool: Tool<ToolResultOf<'email_action'>> = {
             yield { type: 'result', value: { message: res.detail, attachments: res.attachments } };
           } else {
             yield { type: 'error', message: `No message ${act.id} in ${folderOf(act)}.` };
+          }
+          return;
+        }
+
+        case 'mark': {
+          const uids = parseUids(act.id);
+          if (!Array.isArray(uids)) { yield { type: 'error', message: uids.error }; return; }
+          const acct = await resolveAccount(ctx, act.account);
+          const client = await connectImap(ctx, acct);
+          try {
+            await client.mailboxOpen(folderOf(act));
+            if (act.seen) await client.messageFlagsAdd(uids, ['\\Seen'], { uid: true });
+            else          await client.messageFlagsRemove(uids, ['\\Seen'], { uid: true });
+            const marked: string[] = [];
+            const unchanged: string[] = [];
+            for await (const msg of client.fetch(uids, { flags: true }, { uid: true })) {
+              (isSeen(msg.flags) === act.seen ? marked : unchanged).push(String(msg.uid));
+            }
+            const notFound = uids.map(String).filter(id => !marked.includes(id) && !unchanged.includes(id));
+            yield { type: 'result', value: { seen: act.seen, marked, notFound, ...(unchanged.length ? { unchanged } : {}) } };
+          } finally {
+            await client.logout();
           }
           return;
         }

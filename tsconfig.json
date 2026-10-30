@@ -17,5 +17,5 @@
     // name that does not exist on disk.
     "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*", "test/**/*"]
+  "include": ["src/**/*", "test/**/*", "types/**/*"]
 }
